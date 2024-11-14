@@ -1,0 +1,805 @@
+---
+title: 'Analysis of m6A modification information'
+author: "Oliver Cheng, Heejung Shim"
+format:
+  html:
+    toc: true
+    toc-depth: 5
+    theme: cosmo
+    embed-resources: true
+    toc-expand: true
+---
+
+# Setup
+
+## Imports
+
+```{r setup, include=FALSE, echo=FALSE}
+library(GenomicRanges)
+library(GenomicFeatures)
+library(rtracklayer)
+library(txdbmaker)
+
+library(tidyverse)
+library(RColorBrewer)
+
+library(UpSetR)
+
+options(
+  ggplot2.discrete = c("#1B9E77", "#D95F02", "#7570B3", "#E7298A", "#66A61E", "#E6AB02", "#A6761D", "#666666")
+)
+```
+
+```{r}
+ROOT="~/Developer/uni/m6a_report/from_hpc"
+
+data = list(
+  chr = c("chr3", "chr18"),
+  m6anet = list(
+    path = paste0(ROOT, "/data/%s/m6anet/data.site_proba.csv"),
+    threshold = 0.9 # from m6Anet documentation
+  ),
+  mAFiA = list(
+    path = paste0(ROOT, "/data/%s/mAFiA/predicted/%s/mAFiA.sites.bed"),
+    chr = c("chr3", "chr18")
+  ),
+  peaks = paste0(ROOT, "/ref/41588_2020_644_MOESM3_ESM_with_header.bed"),
+  annotation = paste0(ROOT, "/ref/gencode.v19.annotation.gtf"),
+  samples = c("GM07037", "GM07357", "GM10847"),
+  atlas = paste0(ROOT, "/ref/m6a_atlas_v1_hg19.tsv")
+)
+```
+
+## Loading supplementary information
+
+### Transcript expression database
+
+First, load the `txdb` from the GENCODE annotation file:
+
+```{r}
+## import GTF
+txdb <- txdbmaker::makeTxDbFromGFF(data$annotation)
+txdb <- keepStandardChromosomes(txdb, pruning="coarse")
+```
+
+### Extracting regions
+
+We then extract 5' UTR, CDS, and 3' UTR regions from the `txdb`.
+
+```{r}
+regions <- list(
+  utr5 = fiveUTRsByTranscript(txdb, use.names=TRUE),
+  cds = cdsBy(txdb, by="tx", use.names=TRUE),
+  utr3 = threeUTRsByTranscript(txdb, use.names=TRUE)
+)
+```
+
+We also should extract the start codon locations. We do *not* use the GENCODE annotations here; instead, we compute it from the CDS region annotation. See reference <https://support.bioconductor.org/p/96348/>:
+
+```{r}
+first_cds <- heads(regions$cds, n=1)
+
+# some of these start codons cross an intron. see:
+sprintf(fmt="Reads crossing an intron: %d", sum(unlist(width(first_cds)) < 3)) |> cat()
+
+start_codons <- as.data.frame(promoters(first_cds, upstream=0, downstream=3) |> unlist())
+start_codons %>% head()
+```
+
+### Known peaks
+
+From <https://www.nature.com/articles/s41588-020-0644-z>
+
+```{r}
+df.peaks <- read.csv(data$peaks, header = TRUE, sep = "\t")
+    
+(peaks <- GRanges(
+  seqnames <- df.peaks$chr,
+  ranges = IRanges(df.peaks$start, df.peaks$end),
+  name = df.peaks$name
+) )
+```
+
+We also load data from the m6A-Atlas project (version 1, which is hg19).
+
+```{r}
+#| cache: true
+
+m6a.atlas <- read.table(data$atlas, sep = " ", fill = TRUE, col.names = c(
+  "ID", "seqnames", "start", "end", "width", "strand", "V1", "ensembl_ID", "annotation", "gene_biotype", "SeqCont", paste0("V", 2:20)
+))
+m6a.atlas.gr <- GRanges(
+  seqnames = m6a.atlas$seqnames,
+  ranges = IRanges(m6a.atlas$start, m6a.atlas$end),
+  strand = m6a.atlas$strand,
+  name = m6a.atlas$ID
+)
+m6a.atlas.gr
+```
+
+### 
+
+## Load samples
+
+We will store the modification sites in a GRanges object. For now, initialise it to be empty.
+
+```{r}
+modifs <- NULL
+```
+
+### m6Anet
+
+Read in the data from m6Anet.
+
+```{r}
+df.m6anet <- NULL
+for (sample in data$samples)  {
+  data_path <- sprintf(fmt = data$m6anet$path, sample)
+  
+  df.m6anet.sample <- read.csv(data_path) %>%
+    filter(probability_modified > data$m6anet$threshold) %>%
+    mutate(rank = dense_rank(desc(probability_modified))) %>%
+    separate_wider_delim(
+      cols = transcript_id,
+      delim = "|",
+      names = c("ensembl_tx_id", "ensembl_gene_id", "ott_gene_id", "ott_tx_id",
+               "isoform", "gene_id", "tx_len", "regions"),
+      too_many = "merge",
+      too_few = "align_start"
+    ) %>%
+    # split out the utr3, cds, and utr5 from i.e. UTR5:1-70|CDS:71-850|UTR3:851-2661|
+    mutate(
+      utr5_match = str_match(regions, "UTR5:(\\d+)-(\\d+)"),
+      cds_match = str_match(regions, "CDS:(\\d+)-(\\d+)"),
+      utr3_match = str_match(regions, "UTR3:(\\d+)-(\\d+)")
+    ) %>%
+    mutate(
+      utr5_start = as.numeric(utr5_match[,2]),
+      utr5_end = as.numeric(utr5_match[,3]),
+      cds_start = as.numeric(cds_match[,2]),
+      cds_end = as.numeric(cds_match[,3]),
+      utr3_start = as.numeric(utr3_match[,2]),
+      utr3_end = as.numeric(utr3_match[,3])
+    ) %>%
+    select(-utr5_match, -cds_match, -utr3_match, -regions) %>%  # Clean up intermediate matches
+    mutate(
+      sample = sample,
+      source = "m6Anet",
+    )
+  
+  message("Loading: ", data_path, " with count ", nrow(df.m6anet.sample))
+  df.m6anet <- df.m6anet %>% bind_rows(df.m6anet.sample)
+}
+```
+
+#### Performing a liftover from transcript coordinates to genomic coordinates
+
+```{r}
+gr.m6anet.base = GRanges(
+  seqnames = df.m6anet$ensembl_tx_id,
+  ranges = IRanges(start=df.m6anet$transcript_position, width=1),
+  sample = df.m6anet$sample,
+  source = df.m6anet$source,
+  rank = df.m6anet$rank
+)
+
+exons <- exonsBy(txdb, by="tx", use.names=TRUE)
+
+gr.m6anet <- mapFromTranscripts(
+  gr.m6anet.base,
+  exons
+)
+
+ranges(gr.m6anet) <- IRanges(start(gr.m6anet) - 1)
+mcols(gr.m6anet) <- mcols(gr.m6anet.base)[gr.m6anet$xHits,]
+mcols(gr.m6anet)$chr <- factor(
+  gsub("chr", "", seqnames(gr.m6anet)),
+  levels = c(as.character(1:23), "X", "Y", "M")
+)
+
+# split by sample, and then make unique (so there can be duplicates across samples)
+(gr.m6anet <- split(gr.m6anet, ~sample) %>%
+  map(unique) %>%
+  reduce(c))
+```
+
+```{r}
+m6anet <- list(
+  df = df.m6anet,
+  genomic = gr.m6anet
+)
+```
+
+### mAFiA
+
+```{r}
+gr.mafia <- GRanges()
+
+for (sample in data$samples) {
+  for (chr in data$mAFiA$chr) {
+    data_path <- sprintf(fmt = data$mAFiA$path, sample, chr)
+    cat(data_path, "\n")
+    
+    df.mafia.sample <- read.csv(data_path, header = TRUE, sep = "\t") %>%
+      mutate(rank = dense_rank(desc(coverage)))
+    gr.mafia.sample <- GRanges(
+      seqnames = df.mafia.sample$chrom,
+      ranges = IRanges(start = df.mafia.sample$chromStart+1, width=1),
+      sample = sample,
+      source = "mAFiA",
+      rank = df.mafia.sample$rank,
+      chr = factor(
+        gsub("chr", "", df.mafia.sample$chrom),
+        levels = c(as.character(1:23), "X", "Y", "M")
+      )
+    ) %>% unique()
+    
+    gr.mafia <- gr.mafia %>% c(gr.mafia.sample)
+  }
+}
+```
+
+#### Liftover from genomic to transcriptomic coordinates
+
+TODO!
+
+```{r}
+mafia <- list(
+  genomic = gr.mafia
+)
+```
+
+# Analysis (from m6Anet)
+
+We will combine the results first.
+
+```{r}
+gr <- c(
+  m6anet$genomic[seqnames(m6anet$genomic) %in% data$chr],
+  mafia$genomic
+)
+modifs <- m6anet$df
+```
+
+## 1. How many modifications were discovered?
+
+```{r}
+gr %>% as.data.frame() %>%
+  count(source, sample, chr) %>%
+  ggplot(aes(x = chr, y = n, fill = source)) +
+  facet_wrap(~ sample) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "Number of unique modifications detected",
+    subtitle = "On chr3, chr18, genomic coordinates"
+  )
+```
+
+What about overlaps?
+
+```{r}
+df <- split(gr, ~sample) %>%
+  map(function(s.) {
+    s <- split(s., ~source)
+    mcols(s$m6Anet)$overlapped <- !!countOverlaps(s$m6Anet, s$mAFiA)
+    mcols(s$mAFiA)$overlapped <- !!countOverlaps(s$mAFiA, s$m6Anet)
+    return(unlist(s, use.names=FALSE))
+  }) %>%
+  reduce(c) %>%
+  as.data.frame()
+
+ggplot(df %>% count(source, sample, chr), aes(x=chr, y=n, fill=source)) +
+  facet_wrap(~ sample) +
+  geom_col(position = "dodge") +
+  geom_col(
+    aes(x = chr, y = n, colour=source),
+    fill = "black",
+    data = df %>% filter(overlapped) %>% count(source, sample, chr)
+  ) +
+  labs(
+    title = "Number of unique modifications detected",
+    subtitle = "On chr3, chr18, genomic coordinates"
+  )
+```
+
+What about unique (non-overlapping modifications)?
+
+```{r}
+gr.m6anet.subset <- gr[gr$source == "m6Anet"] %>% 
+  .[order(mcols(.)$rank),] %>%
+  unique()
+gr.mafia.subset <- gr[gr$source == "mAFiA"] %>% 
+  .[order(mcols(.)$rank),] %>%
+  unique()
+
+data.frame(
+  source = c("m6Anet", "mAFiA"),
+  count = c(length(gr.m6anet.subset), length(gr.mafia.subset))
+) %>% ggplot(aes(x = source, y = count)) +
+  geom_col() +
+  labs(
+    title = "Number of unique modifications found across all samples",
+    subtitle = "Only for chromosomes 3 and 18"
+  )
+```
+
+And can we determine the number of unique modifications, per region?
+
+```{r}
+uniques <- split(gr, ~sample) %>%
+  map(function(gr.subset) {
+    s <- split(gr.subset, ~source)
+    s$m6Anet$overlap = !!countOverlaps(s$m6Anet, s$mAFiA)
+    s$mAFiA$overlap = !!countOverlaps(s$mAFiA, s$m6Anet)
+    
+    return(s)
+  })
+```
+
+## 2. m6Anet only (all chromosomes)
+
+How many unique isoforms?
+
+```{r}
+#| label: summary-table
+#| fig-cap: "Summary of results from m6Anet run on our samples"
+
+modifs %>%
+  group_by(source, sample) %>%
+  count(ensembl_tx_id) %>%
+  summarize(
+    isoforms = n(),
+    modifications = sum(n),
+    mean_modifs_per_isoform = mean(n),
+    .groups="drop_last") %>%
+  ungroup()
+```
+
+Count the genomic modifications
+
+```{r}
+split(m6anet$genomic, ~sample) %>%
+  map(\(x) length(x))
+```
+
+How many m6A modifications are on each chromosome?
+
+```{r}
+( modifs.chrCounts <- m6anet$genomic %>%
+  as.data.frame() %>% 
+  count(sample, chr) )
+```
+
+What is the modification count by chromosome?
+
+```{r}
+#| label: modifs-by-chromosome-count
+
+modifs.chrCounts %>%
+  ggplot(aes(x = chr, y = n, fill = sample)) +
+  geom_col(position = "dodge") +
+  theme(legend.position = "bottom") +
+  labs(
+    x = "chromosome",
+    y = "number of modifications",
+    title = "Modification count by chromosome",
+    subtitle = "m6Anet only, for all chromosomes"
+  )
+```
+
+Read depth:
+
+```{r}
+#| label: sample-sequencing-depth
+
+# todo: update this to actually read in the fastq files
+
+depths <- data.frame(
+  sample = c("GM07037", "GM07357", "GM10847"),
+  read_depth = c(2411829, 4497395, 3871656)
+)
+
+ggplot(depths, aes(x = sample, y = read_depth, fill = sample)) +
+  geom_col() +
+  theme(legend.position = "none") +
+  labs(title = "Sequencing depth of samples", x = "number of reads")
+```
+
+```{r}
+#| label: modifs-by-chromosome-freq
+
+modifs.chrCounts %>%
+  group_by(sample) %>%
+  mutate(n_rel = n / sum(n)) %>%
+  ggplot(aes(x = chr, y = n_rel, fill = sample)) +
+  geom_col(position = "dodge") +
+  theme(legend.position = "bottom") +
+  labs(
+    x = "chromosome",
+    y = "relative frequency",
+    title = "Relative frequency of modifications by chromosome",
+    subtitle = "m6Anet only, for all chromosomes"
+  )
+```
+
+## 3. Compare to known m6A modifications (GRCh37, m6A-Atlas 1)
+
+Here:
+
+```{r}
+#maxgap = 0L
+compare_to_atlas <- function(gr) {
+  ov <- !!countOverlaps(gr, m6a.atlas.gr)
+  tp <- sum(ov)
+  fp <- sum(!ov)
+  
+  return(list(
+    overlaps = tp,
+    missed = fp,
+    precision = tp / (tp + fp),
+    supported = ov
+  ))
+}
+
+ov <- compare_to_atlas(gr)
+mcols(gr)$supportedByAtlas <- ov$supported
+message("Overlaps: ", ov$overlaps, ", missed: ", ov$missed, ", precision: ", ov$precision)
+```
+
+```{r}
+( modifs.supportedCount <- gr %>% as.data.frame() %>%
+  count(source, sample, supportedByAtlas) )
+```
+
+```{r}
+ggplot(modifs.supportedCount, aes(x = source, y = n, fill = supportedByAtlas)) +
+  geom_col() +
+  facet_wrap(~ sample) +
+  labs(
+    title = "Read counts supported by m6A-Atlas v1",
+    subtitle = "m6Anet and mAFiA, only chr3 and chr18, all coordinates mapped to genome"
+  )
+```
+
+Reads found by mAFiA
+
+```{r}
+mafia$genomic %>% as.data.frame() %>% count(sample)
+```
+
+## 4. Do m6Anet and mAFiA overlap much?
+
+```{r}
+intersection <- sum(!!countOverlaps(gr.m6anet.subset, gr.mafia.subset))
+mafia.intersect <- sum(!!countOverlaps(gr.mafia.subset, gr.m6anet.subset))
+
+stopifnot(intersection == mafia.intersect)
+
+data.frame(
+  type = c("m6Anet only", "mAFiA only", "m6Anet & mAFiA"),
+  count = c(length(gr.m6anet.subset), length(gr.mafia.subset), intersection)
+) %>%
+  ggplot(aes(x = type, y = count)) +
+  geom_col() +
+  labs(
+    title = "Intersections between reads"
+  ) +
+  theme(
+    axis.title.x = element_blank()
+  )
+```
+
+## 5. Overlaps between samples
+
+```{r}
+#| label: per-sample-overlap-m6anet
+
+s <- split(m6anet$genomic, ~sample)
+a. <- s$GM07037
+b. <- s$GM07357
+c. <- s$GM10847
+
+.all <- countOverlaps(c., subsetByOverlaps(a., b.)) %>% sum()
+.ab <- sum(countOverlaps(a., b.)) - .all
+.ac <- sum(countOverlaps(a., c.)) - .all
+.bc <- sum(countOverlaps(b., c.)) - .all
+.a <- length(a.) - .all - .ac - .ab
+.b <- length(b.) - .all - .ab - .bc
+.c <- length(c.) - .all - .ac - .bc
+
+# todo: make better
+all <- countOverlaps(s$GM10847, subsetByOverlaps(s$GM07037, s$GM07357)) %>% sum()
+input = c(
+  "GM07037&GM07357&GM10847" = .all,
+  "GM07037&GM07357" = .ab,
+  "GM07037&GM10847" = .ac,
+  "GM07357&GM10847" = .bc,
+  "GM07037" = .a,
+  "GM07357" = .b,
+  "GM10847" = .c
+)
+
+upset(
+  fromExpression(input)
+)
+```
+
+```{r}
+#| label: per-sample-overlap-mafia
+
+s <- split(m6anet$genomic, ~sample)
+a. <- s$GM07037
+b. <- s$GM07357
+c. <- s$GM10847
+
+.all <- countOverlaps(c., subsetByOverlaps(a., b.)) %>% sum()
+.ab <- sum(countOverlaps(a., b.)) - .all
+.ac <- sum(countOverlaps(a., c.)) - .all
+.bc <- sum(countOverlaps(b., c.)) - .all
+.a <- length(a.) - .all - .ac - .ab
+.b <- length(b.) - .all - .ab - .bc
+.c <- length(c.) - .all - .ac - .bc
+
+# todo: make better
+all <- countOverlaps(s$GM10847, subsetByOverlaps(s$GM07037, s$GM07357)) %>% sum()
+input = c(
+  "GM07037&GM07357&GM10847" = .all,
+  "GM07037&GM07357" = .ab,
+  "GM07037&GM10847" = .ac,
+  "GM07357&GM10847" = .bc,
+  "GM07037" = .a,
+  "GM07357" = .b,
+  "GM10847" = .c
+)
+
+upset(
+  fromExpression(input)
+)
+```
+
+## 6. Metagene plot
+
+```{r}
+params <- data.frame(
+  type = c("utr5", "cds", "utr3"),
+  offset = c(0, 0.6, 2),
+  width = c(0.6, 1.4, 1)
+)
+rownames(params) <- params$type
+params$centre <- params$offset + params$width / 2
+```
+
+```{r}
+modifs.graph <- modifs %>%
+  mutate(
+    region = case_when(
+      between(transcript_position, utr5_start, utr5_end) ~ "utr5",
+      between(transcript_position, cds_start, cds_end) ~ "cds",
+      between(transcript_position, utr3_start, utr3_end) ~ "utr3",
+      .default = NA
+    ),
+    norm = case_match(
+      region,
+      "utr5" ~ (transcript_position - utr5_start) / (utr5_end - utr5_start),
+      "cds" ~ (transcript_position - cds_start) / (cds_end - cds_start),
+      "utr3" ~ (transcript_position - utr3_start) / (utr3_end - utr3_start)
+    ),
+    graph_coords = norm * params[region, "width"] + params[region, "offset"]
+  )
+
+rejected <- modifs.graph %>% filter(is.na(region))
+message("Ignored ", nrow(rejected), " reads as there is no associated region information")
+modifs.graph <- modifs.graph %>% filter(!is.na(region))
+```
+
+```{r}
+ggplot(modifs.graph, aes(x = graph_coords)) +
+  geom_density(aes(colour = sample, linetype = source)) +
+  geom_vline(data=params, aes(xintercept=offset), linetype="dashed", colour="darkgray") +
+  geom_text(data=params, aes(x=centre, label=type), y=-0.1) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.title.x = element_blank(),
+    panel.spacing.y = unit(2, "lines"),
+    plot.margin = unit(c(1, 1, 2, 1), "lines")
+  ) +
+  geom_hline(yintercept = 0) + geom_vline(xintercept = 0) +
+  coord_cartesian(c(0, 3), c(0, 1.5), clip = "off") +
+  annotate("segment", x = 0, xend = 0.55, y = -0.05, yend = -0.05, arrow = arrow(type = "closed", length = unit(0.02, "npc")), color = "black") +
+  annotate("segment", x = 0.55, xend = 0, y = -0.05, yend = -0.05, arrow = arrow(type = "closed", length = unit(0.02, "npc")), color = "black") +
+  annotate("segment", x = 0.65, xend = 1.95, y = -0.05, yend = -0.05, arrow = arrow(type = "closed", length = unit(0.02, "npc")), color = "black") +
+  annotate("segment", x = 1.95, xend = 0.65, y = -0.05, yend = -0.05, arrow = arrow(type = "closed", length = unit(0.02, "npc")), color = "black") +
+  annotate("segment", x = 2.05, xend = 3, y = -0.05, yend = -0.05, arrow = arrow(type = "closed", length = unit(0.02, "npc")), color = "black") +
+  annotate("segment", x = 3, xend = 2.05, y = -0.05, yend = -0.05, arrow = arrow(type = "closed", length = unit(0.02, "npc")), color = "black") +
+  labs(
+    title = "Metagene plot",
+    subtitle = "m6Anet only",
+    y = "Density (predicted m6A sites)"
+  )
+```
+
+## Make the metagene plot for mAFiA data
+### Helper function
+
+```{r}
+transcripts_overlapping_region <- function(pos) {
+  matches <- NULL
+  
+  for (region in names(regions)) {
+    cat("Region", region, "\n")
+    ranges <- regions[[region]]
+    
+    df <- mergeByOverlaps(pos, ranges)
+    df <- as.data.frame(df)
+    
+    if (nrow(df)) {
+      df$norm <- mapply(normalize_position_disjoint, df$ranges, df$pos.start)
+      df$txid <- names(df$ranges)
+      df$type <- region
+      
+      matches <- rbind(matches, df)
+    }
+  }
+  
+  return(matches)
+}
+
+normalize_position_disjoint <- function(gr, position) {
+  # Create a vector to store the cumulative lengths of the regions up to each segment
+  cumulative_lengths <- cumsum(width(gr))
+  
+  # Find which range segment the position falls into
+  segment_idx <- findOverlaps(GRanges(seqnames = seqnames(gr)[1], IRanges(position, position)), gr)
+  
+  if (length(segment_idx) == 0) {
+    return(NA)  # If position does not fall within the ranges
+  } else {
+    idx <- subjectHits(segment_idx)[1]  # Index of the segment in GRanges
+    
+    # Calculate the position relative to the start of the current segment
+    pos_in_segment <- position - start(gr)[idx]
+    
+    # Calculate the cumulative position
+    if (idx == 1) {
+      rel_position <- pos_in_segment / sum(width(gr))  # If in the first segment, divide by total width
+    } else {
+      # Add the position in the current segment to the cumulative length of previous segments
+      rel_position <- (cumulative_lengths[idx - 1] + pos_in_segment) / sum(width(gr))
+    }
+    return(rel_position)
+  }
+}
+```
+
+### Application
+
+Apply this function to `gr`.
+
+```{r}
+( positions <- transcripts_overlapping_region(mafia$genomic) )
+```
+
+Next, we find the distance of the modification from the (first base of the) start codon.
+
+```{r}
+positions$start_codon_pos = start_codons[positions$txid, "start"]
+positions$start_codon_dist = abs(positions$pos.start - positions$start_codon_pos)
+
+positions
+```
+
+The reads that do not correspond with a UTR or CDS region are:
+
+```{r}
+# in_cds.idx <- paste(seqnames(modifs), start(modifs)) %in% paste(positions$pos.seqnames, positions$pos.start)
+# 
+# ( not_in_cds <- modifs[!in_cds.idx] )
+# cat(sprintf(
+#   fmt = "%d not in a CDS or UTR, out of %d total",
+#   length(not_in_cds),
+#   length(modifs)
+# ))
+# as.data.frame(not_in_cds) %>% group_by(sample, source, seqnames) %>% summarize(count = n())
+```
+
+### Methods for dealing with the 5' UTR region
+
+We choose to optimistically only select transcript annotations in the 5' UTR region, if there is any ambiguity between whether it is a UTR read or a CDS read.
+
+#### Always select 5' UTR annotations when ambiguous between CDS and 5' UTR
+
+```{r}
+positions.subset <- positions %>%
+  group_by(pos.seqnames, pos.start, source, sample) %>%
+  mutate(
+    has_chr_utr5 = any(type == "cds") & any(type == "utr5")
+  ) %>%
+  filter(
+    !has_chr_utr5 | (has_chr_utr5 & type == "utr5")
+  ) %>%
+  slice_sample(n=1) %>%
+  ungroup()
+
+cat(sprintf(
+  fmt="Number of CDS and 5' UTR overlaps: %d\n",
+  positions.subset$has_chr_utr5 %>% sum()
+))
+  # slice(
+  #   ifelse(
+  #     all(has_cds & has_utr5),
+  #     which.min(start_codon_dist), # choose the smallest start codon distance
+  #     sample(1:n(), 1)             # or randomly sample
+  #   ),
+  # )
+```
+
+#### Randomly select a read in every duplicate group
+
+If a modification overlaps with both a 5' UTR and CDS region, then we will choose the row with the lowest `start_codon_dist`. Otherwise, we randomly sample.
+
+```{r}
+# positions.subset <- positions %>%
+#   group_by(pos.seqnames, pos.start, source) %>%
+#   mutate(has_cds = any(type == "cds"), has_utr5 = any(type == "utr5")) %>%
+#   slice(
+#     ifelse(
+#       all(has_cds & has_utr5),
+#       which.min(start_codon_dist), # choose the smallest start codon distance
+#       sample(1:n(), 1)             # or randomly sample
+#     ),
+#   )
+
+# Alternatively, only randomly sample
+positions.subset <- positions %>%
+  group_by(sample, pos.seqnames, pos.start) %>%
+  slice_sample(n=1)
+```
+
+```{r}
+params <- data.frame(
+  type = c("utr5", "cds", "utr3"),
+  offset = c(0, 0.6, 2),
+  width = c(0.6, 1.4, 1)
+)
+rownames(params) <- params$type
+params$centre <- params$offset + params$width / 2
+```
+
+```{r}
+positions.subset <- positions.subset %>% 
+  mutate(
+    graph_coords = norm * params[type, "width"] + params[type, "offset"]
+  )
+positions.subset
+```
+And the metagene plot combined:
+
+```{r fig.width=7}
+ggplot(positions.subset, aes(x = graph_coords)) +
+  geom_density(aes(colour = sample, linetype = source)) +
+  geom_vline(data=params, aes(xintercept=offset), linetype="dashed", colour="darkgray") +
+  geom_text(data=params, aes(x=centre, label=type), y=-0.1) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.title.x = element_blank(),
+    panel.spacing.y = unit(2, "lines"),
+    plot.margin = unit(c(1, 1, 2, 1), "lines")
+  ) +
+  geom_hline(yintercept = 0) + geom_vline(xintercept = 0) +
+  labs(title = "Metagene plot", y = "Density (predicted m6A sites)") +
+  coord_cartesian(c(0, 3), c(0, 1), clip = "off") +
+  annotate("segment", x = 0, xend = 0.55, y = -0.05, yend = -0.05, arrow = arrow(type = "closed", length = unit(0.02, "npc")), color = "black") +
+  annotate("segment", x = 0.55, xend = 0, y = -0.05, yend = -0.05, arrow = arrow(type = "closed", length = unit(0.02, "npc")), color = "black") +
+  annotate("segment", x = 0.65, xend = 1.95, y = -0.05, yend = -0.05, arrow = arrow(type = "closed", length = unit(0.02, "npc")), color = "black") +
+  annotate("segment", x = 1.95, xend = 0.65, y = -0.05, yend = -0.05, arrow = arrow(type = "closed", length = unit(0.02, "npc")), color = "black") +
+  annotate("segment", x = 2.05, xend = 3, y = -0.05, yend = -0.05, arrow = arrow(type = "closed", length = unit(0.02, "npc")), color = "black") +
+  annotate("segment", x = 3, xend = 2.05, y = -0.05, yend = -0.05, arrow = arrow(type = "closed", length = unit(0.02, "npc")), color = "black")
+```
